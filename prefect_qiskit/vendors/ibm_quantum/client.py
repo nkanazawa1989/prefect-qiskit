@@ -19,6 +19,7 @@ import asyncio
 import functools
 import json
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 
@@ -86,6 +87,32 @@ class SessionCache(LRUCache):
         return endpoint, session
 
 
+class ThreadAsyncLock:
+    """Hybrid lock mechanism to prevent race condition on session cache.
+
+    The :class:`IBMQuantumPlatformClient` implements the :class:`AsyncRuntimeClientInterface`,
+    and we assume its primary concurrency operation is asyncio.
+    However, within Prefect workflows, the :class:`QuantumRuntime` is often used
+    inside Prefect tasks, and such tasks can run through task runners.
+    Because the default task runner in Prefect is the :class:`ThreadPoolTaskRunner`,
+    we also need to consider the race condition by threading.
+
+    Without proper race condition handling, concurrent HTTP requests may
+    create multiple HTTP sessions, resulting in the socket leakage.
+    This hybrid lock prevents the race condition in both scenarios.
+    """
+
+    def __init__(self):
+        self.thread_lock = threading.Lock()
+        self.async_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def acquire(self):
+        with self.thread_lock:
+            async with self.async_lock:
+                yield
+
+
 class IBMQuantumPlatformClient(LoggingMixin):
     """Adaptor interface for IBM Quantum Platform cloud client.
 
@@ -109,7 +136,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
     AVOID_RETRY = [9999]
 
     _sessions = SessionCache(maxsize=3)
-    _lock = threading.Lock()
+    _lock = ThreadAsyncLock()
 
     def __init__(
         self,
@@ -136,14 +163,10 @@ class IBMQuantumPlatformClient(LoggingMixin):
     def __repr__(self):
         return f"<{self.__class__.__name__} runtime_endpoint_url={self.runtime_endpoint_url!r}>"
 
-    def _get_session(
+    async def _get_session(
         self,
     ) -> aiohttp.ClientSession:
-        # Lock is necessary because Prefect tasks calling this client
-        # might be run by the ThreadPoolTaskRunner. In this case,
-        # race condition may occur and multiple HTTP sessions are initialized for the same key.
-        # This eventually results in the socket leakage.
-        with self._lock:
+        async with self._lock.acquire():
             session = self._sessions.get(self.runtime_endpoint_url)
             if session is None or session.closed:
                 self.logger.debug(f"Creating new HTTP session for {self.runtime_endpoint_url!r}")
@@ -171,7 +194,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self,
         resource_name: str,
     ) -> bool:
-        session = self._get_session()
+        session = await self._get_session()
         async with session.get(
             f"backends/{resource_name}/status",
             headers=self._get_headers(),
@@ -184,7 +207,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
     async def get_resources(
         self,
     ) -> list[str]:
-        session = self._get_session()
+        session = await self._get_session()
         async with session.get(
             "backends",
             headers=self._get_headers(),
@@ -199,7 +222,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self,
         resource_name: str,
     ) -> Target:
-        session = self._get_session()
+        session = await self._get_session()
         headers = self._get_headers()
         async with session.get(
             f"backends/{resource_name}/configuration",
@@ -284,7 +307,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self.logger.debug(f"Submitting the following payload: {payload}")
         data = json.dumps(payload, cls=RuntimeEncoder)
 
-        session = self._get_session()
+        session = await self._get_session()
         async with session.post(
             "jobs",
             data=data,
@@ -307,7 +330,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self,
         job_id: str,
     ) -> PrimitiveResult:
-        session = self._get_session()
+        session = await self._get_session()
         async with session.get(
             f"jobs/{job_id}/results",
             headers=self._get_headers(),
@@ -335,7 +358,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self,
         job_id: str,
     ) -> JOB_STATUS:
-        session = self._get_session()
+        session = await self._get_session()
         async with session.get(
             f"jobs/{job_id}",
             headers=self._get_headers(),
@@ -388,7 +411,7 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self,
         job_id: str,
     ) -> JobMetrics:
-        session = self._get_session()
+        session = await self._get_session()
         async with session.get(
             f"jobs/{job_id}/metrics",
             headers=self._get_headers(),

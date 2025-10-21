@@ -63,7 +63,7 @@ def mock_http_response(
         monkeypatch.setattr(
             IBMQuantumPlatformClient,
             "_get_session",
-            MagicMock(return_value=mock_session),
+            AsyncMock(return_value=mock_session),
         )
 
     return _setup
