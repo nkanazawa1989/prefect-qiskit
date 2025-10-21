@@ -25,7 +25,6 @@ import json
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock
 
-import aiohttp
 import pytest
 from prefect import get_client
 from prefect.client.schemas.filters import ArtifactFilter
@@ -35,6 +34,7 @@ from utils import assert_sampler_fidelity
 
 from prefect_qiskit import QuantumRuntime
 from prefect_qiskit.vendors.ibm_quantum import IBMQuantumCredentials
+from prefect_qiskit.vendors.ibm_quantum.client import IBMQuantumPlatformClient
 
 RESPONSE = Path(__file__).parent / "http_response"
 
@@ -130,12 +130,11 @@ def mock_http_response(
         MagicMock(side_effect=post_mock_resp),
     )
 
-    # Monkeypatch ClientSession with mock
-    mock_session_ctx = AsyncMock()
-    mock_session_ctx.__aenter__.return_value = mock_session
-    mock_session_ctx.__aexit__.return_value = None
-
-    monkeypatch.setattr(aiohttp, "ClientSession", MagicMock(return_value=mock_session_ctx))
+    monkeypatch.setattr(
+        IBMQuantumPlatformClient,
+        "_get_session",
+        MagicMock(return_value=mock_session),
+    )
 
 
 def test_sampler_e2e(

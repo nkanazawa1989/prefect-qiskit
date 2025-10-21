@@ -29,6 +29,7 @@ from yarl import URL
 
 from prefect_qiskit.exceptions import RuntimeJobFailure
 from prefect_qiskit.vendors.ibm_quantum import IBMQuantumCredentials
+from prefect_qiskit.vendors.ibm_quantum.client import IBMQuantumPlatformClient
 
 MockHttpRespSetup: TypeAlias = Callable[..., None]
 
@@ -59,12 +60,11 @@ def mock_http_response(
         mock_session = MagicMock()
         setattr(mock_session, method, MagicMock(return_value=mock_response_ctx))
 
-        # Monkeypatch ClientSession with mock
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__.return_value = mock_session
-        mock_session_ctx.__aexit__.return_value = None
-
-        monkeypatch.setattr(aiohttp, "ClientSession", MagicMock(return_value=mock_session_ctx))
+        monkeypatch.setattr(
+            IBMQuantumPlatformClient,
+            "_get_session",
+            MagicMock(return_value=mock_session),
+        )
 
     return _setup
 

@@ -15,13 +15,15 @@ See the following link for the REST API specification.
 https://quantum.cloud.ibm.com/docs/en/api/qiskit-runtime-rest#qiskit-runtime-rest-api
 """
 
+import asyncio
+import functools
 import json
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+import threading
 from datetime import datetime
 from typing import Any, Literal
 
 import aiohttp
+from cachetools import LRUCache
 from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
 from pydantic import SecretStr, ValidationError
 from qiskit.primitives.containers import PrimitiveResult
@@ -42,57 +44,72 @@ DEFAULT_AUTH_URL: str = "https://iam.cloud.ibm.com"
 DEFAULT_RUNTIME_URL: str = "https://quantum.cloud.ibm.com/api/v1/"
 
 
-@asynccontextmanager
-async def runtime_session_ctx(
-    client: "IBMQuantumPlatformClient",
-    timeout: int = 30,
-) -> AsyncGenerator[aiohttp.ClientSession, None]:
-    """Asynchronous HTTP session context with error handling.
+def handle_error(method):
+    """A method decorator to prevent accidental secrets print out and error typecast."""
 
-    Automatically add authentication and CRN in the HTTP request header.
-    Catch client error not to print sensitive header in the stack trace.
-    """
-    timeout = aiohttp.ClientTimeout(total=timeout)
-    headers = {
-        "IBM-API-Version": "2025-01-01",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {client.auth.token_manager.get_token()}",
-        "Service-CRN": client.crn,
-    }
-    try:
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers=headers,
-            base_url=client.runtime_endpoint_url,
-            raise_for_status=True,
-        ) as session:
-            yield session
-    except aiohttp.ClientResponseError as ex:
-        raise RuntimeJobFailure(
-            reason=f"HTTP {ex.status} on {ex.request_info.url}.",
-            retry=True,
-        ) from None
-    except aiohttp.ClientConnectionError:
-        raise RuntimeJobFailure(
-            reason=f"Connection failed to {client.runtime_endpoint_url}.",
-            retry=True,
-        ) from None
-    except TimeoutError:
-        raise RuntimeJobFailure(
-            reason="HTTP request timed out.",
-            retry=True,
-        ) from None
-    except aiohttp.ClientError as ex:
-        raise RuntimeJobFailure(
-            reason=f"General HTTP client error {ex.__class__.__name__}.",
-            retry=True,
-        ) from None
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except aiohttp.ClientResponseError as ex:
+            raise RuntimeJobFailure(
+                reason=f"HTTP {ex.status} on {ex.request_info.url!r}.",
+                retry=True,
+            ) from None
+        except aiohttp.ClientConnectionError:
+            raise RuntimeJobFailure(
+                reason=f"Connection failed to {self.runtime_endpoint_url!r}.",
+                retry=True,
+            ) from None
+        except TimeoutError:
+            raise RuntimeJobFailure(
+                reason="HTTP request timed out.",
+                retry=True,
+            ) from None
+        except aiohttp.ClientError as ex:
+            raise RuntimeJobFailure(
+                reason=f"General HTTP client error {ex.__class__.__name__}.",
+                retry=True,
+            ) from None
+
+    return wrapper
+
+
+class SessionCache(LRUCache):
+    """LRU cache with session closing at expire."""
+
+    def popitem(self):
+        """Remove session with termination of removed session."""
+        endpoint, session = super().popitem()
+        if not session.closed:
+            asyncio.run(session.close())
+        return endpoint, session
 
 
 class IBMQuantumPlatformClient(LoggingMixin):
-    """Adaptor interface for IBM Quantum Platform cloud client."""
+    """Adaptor interface for IBM Quantum Platform cloud client.
+
+    .. note::
+        This class maintains a **class-level cache** of HTTP sessions, keyed by endpoint URL.
+        The cache enables efficient reuse of TCP connections for frequent HTTP requests.
+
+        By design, each cached session keeps its underlying TCP socket open
+        for the duration of the TCP keep-alive cycle, rather than closing it after each request.
+
+        When this class is initialized across multiple processes (for example, via
+        :class:`concurrent.futures.ProcessPoolExecutor`), each process establishes its
+        own socket per endpoint—even if no HTTP request is made.
+
+        Because this class implements :class:`AsyncRuntimeClientInterface`, it assumes
+        that concurrent operations are coordinated by **asyncio**, rather than by
+        multiprocessing or distributed task runners.
+
+    """
 
     AVOID_RETRY = [9999]
+
+    _sessions = SessionCache(maxsize=3)
+    _lock = threading.Lock()
 
     def __init__(
         self,
@@ -116,42 +133,92 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self.crn = crn
         self.runtime_endpoint_url = runtime_endpoint_url
 
+    def __repr__(self):
+        return f"<{self.__class__.__name__} runtime_endpoint_url={self.runtime_endpoint_url!r}>"
+
+    def _get_session(
+        self,
+    ) -> aiohttp.ClientSession:
+        # Lock is necessary because Prefect tasks calling this client
+        # might be run by the ThreadPoolTaskRunner. In this case,
+        # race condition may occur and multiple HTTP sessions are initialized for the same key.
+        # This eventually results in the socket leakage.
+        with self._lock:
+            session = self._sessions.get(self.runtime_endpoint_url)
+            if session is None or session.closed:
+                self.logger.debug(f"Creating new HTTP session for {self.runtime_endpoint_url!r}")
+                session = aiohttp.ClientSession(
+                    base_url=self.runtime_endpoint_url,
+                    timeout=aiohttp.ClientTimeout(30),
+                    raise_for_status=True,
+                )
+                self._sessions[self.runtime_endpoint_url] = session
+        return session
+
+    def _get_headers(
+        self,
+    ) -> dict[str, str]:
+        headers = {
+            "IBM-API-Version": "2025-01-01",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.auth.token_manager.get_token()}",
+            "Service-CRN": self.crn,
+        }
+        return headers
+
+    @handle_error
     async def check_resource_available(
         self,
         resource_name: str,
     ) -> bool:
-        async with runtime_session_ctx(self) as session:
-            async with session.get(f"backends/{resource_name}/status") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                ret = await resp.json()
+        session = self._get_session()
+        async with session.get(
+            f"backends/{resource_name}/status",
+            headers=self._get_headers(),
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            ret = await resp.json()
         return ret.get("state", False)
 
+    @handle_error
     async def get_resources(
         self,
     ) -> list[str]:
-        async with runtime_session_ctx(self) as session:
-            async with session.get("backends") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                ret = await resp.json()
+        session = self._get_session()
+        async with session.get(
+            "backends",
+            headers=self._get_headers(),
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            ret = await resp.json()
         devices = ret.get("devices", [])
         return [d["name"] for d in devices if d["status"]["name"] == "online"]
 
+    @handle_error
     async def get_target(
         self,
         resource_name: str,
     ) -> Target:
-        async with runtime_session_ctx(self) as session:
-            async with session.get(f"backends/{resource_name}/configuration") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                configuration_dict = await resp.json()
-            async with session.get(f"backends/{resource_name}/properties") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                properties_dict = await resp.json()
+        session = self._get_session()
+        headers = self._get_headers()
+        async with session.get(
+            f"backends/{resource_name}/configuration",
+            headers=headers,
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            configuration_dict = await resp.json()
+        async with session.get(
+            f"backends/{resource_name}/properties",
+            headers=headers,
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            properties_dict = await resp.json()
         return convert_to_target(
             configuration=BackendConfiguration.from_dict(configuration_dict),
             properties=BackendProperties.from_dict(properties_dict),
         )
 
+    @handle_error
     async def run_primitive(
         self,
         program_id: Literal["sampler", "estimator"],
@@ -217,11 +284,15 @@ class IBMQuantumPlatformClient(LoggingMixin):
         self.logger.debug(f"Submitting the following payload: {payload}")
         data = json.dumps(payload, cls=RuntimeEncoder)
 
-        async with runtime_session_ctx(self, timeout=900) as session:
-            async with session.post("jobs", data=data) as resp:
-                self.logger.debug(f"POST request for {resp.url}")
-                ret = await resp.json()
-
+        session = self._get_session()
+        async with session.post(
+            "jobs",
+            data=data,
+            headers=self._get_headers(),
+            timeout=aiohttp.ClientTimeout(900),
+        ) as resp:
+            self.logger.debug(f"POST request for {resp.url}")
+            ret = await resp.json()
         if job_id := ret.get("id", None):
             self.logger.info(f"Job started with job ID {job_id}.")
         else:
@@ -231,14 +302,18 @@ class IBMQuantumPlatformClient(LoggingMixin):
             )
         return job_id
 
+    @handle_error
     async def get_primitive_result(
         self,
         job_id: str,
     ) -> PrimitiveResult:
-        async with runtime_session_ctx(self) as session:
-            async with session.get(f"jobs/{job_id}/results") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                ret = await resp.text()
+        session = self._get_session()
+        async with session.get(
+            f"jobs/{job_id}/results",
+            headers=self._get_headers(),
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            ret = await resp.text()
         # Assume job ID is valid.
         # This is true as long as job is not exposed to user program.
         results = ResultDecoder.decode(ret)
@@ -255,14 +330,18 @@ class IBMQuantumPlatformClient(LoggingMixin):
                 res.metadata["span"] = span_info
         return results
 
+    @handle_error
     async def get_job_status(
         self,
         job_id: str,
     ) -> JOB_STATUS:
-        async with runtime_session_ctx(self) as session:
-            async with session.get(f"jobs/{job_id}") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                ret = await resp.json()
+        session = self._get_session()
+        async with session.get(
+            f"jobs/{job_id}",
+            headers=self._get_headers(),
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            ret = await resp.json()
         job_state = ret.get("state", {})
 
         match status := ret.get("status", "unknown").upper():
@@ -304,14 +383,18 @@ class IBMQuantumPlatformClient(LoggingMixin):
                     retry=True,
                 )
 
+    @handle_error
     async def get_job_metrics(
         self,
         job_id: str,
     ) -> JobMetrics:
-        async with runtime_session_ctx(self) as session:
-            async with session.get(f"jobs/{job_id}/metrics") as resp:
-                self.logger.debug(f"GET request for {resp.url}")
-                ret = await resp.json()
+        session = self._get_session()
+        async with session.get(
+            f"jobs/{job_id}/metrics",
+            headers=self._get_headers(),
+        ) as resp:
+            self.logger.debug(f"GET request for {resp.url}")
+            ret = await resp.json()
 
         if "timestamps" in ret:
             try:
