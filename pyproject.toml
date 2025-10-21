@@ -104,6 +104,9 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 timeout = 90
+markers = [
+    "real_auth: mark a test to use real IAM authentication"
+]
 
 [tool.dynamic-versioning]
 enable = true

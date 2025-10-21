@@ -19,7 +19,6 @@ import asyncio
 import functools
 import json
 import threading
-from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 
@@ -87,32 +86,6 @@ class SessionCache(LRUCache):
         return endpoint, session
 
 
-class ThreadAsyncLock:
-    """Hybrid lock mechanism to prevent race condition on session cache.
-
-    The :class:`IBMQuantumPlatformClient` implements the :class:`AsyncRuntimeClientInterface`,
-    and we assume its primary concurrency operation is asyncio.
-    However, within Prefect workflows, the :class:`QuantumRuntime` is often used
-    inside Prefect tasks, and such tasks can run through task runners.
-    Because the default task runner in Prefect is the :class:`ThreadPoolTaskRunner`,
-    we also need to consider the race condition by threading.
-
-    Without proper race condition handling, concurrent HTTP requests may
-    create multiple HTTP sessions, resulting in the socket leakage.
-    This hybrid lock prevents the race condition in both scenarios.
-    """
-
-    def __init__(self):
-        self.thread_lock = threading.Lock()
-        self.async_lock = asyncio.Lock()
-
-    @asynccontextmanager
-    async def acquire(self):
-        with self.thread_lock:
-            async with self.async_lock:
-                yield
-
-
 class IBMQuantumPlatformClient(LoggingMixin):
     """Adaptor interface for IBM Quantum Platform cloud client.
 
@@ -135,8 +108,8 @@ class IBMQuantumPlatformClient(LoggingMixin):
 
     AVOID_RETRY = [9999]
 
-    _sessions = SessionCache(maxsize=3)
-    _lock = ThreadAsyncLock()
+    _sessions = SessionCache(maxsize=10)
+    _lock = asyncio.Lock()
 
     def __init__(
         self,
@@ -166,16 +139,20 @@ class IBMQuantumPlatformClient(LoggingMixin):
     async def _get_session(
         self,
     ) -> aiohttp.ClientSession:
-        async with self._lock.acquire():
-            session = self._sessions.get(self.runtime_endpoint_url)
+        async with self._lock:
+            # aiohttp is single thread application because it binds current event loop.
+            # Reusing cached session in different thread doesn't resolve the loop.
+            current_thread = threading.current_thread().name
+            url = self.runtime_endpoint_url
+            session = self._sessions.get((current_thread, url))
             if session is None or session.closed:
-                self.logger.debug(f"Creating new HTTP session for {self.runtime_endpoint_url!r}")
+                self.logger.debug(f"Creating new HTTP session for {url!r} in {current_thread}")
                 session = aiohttp.ClientSession(
-                    base_url=self.runtime_endpoint_url,
+                    base_url=url,
                     timeout=aiohttp.ClientTimeout(30),
                     raise_for_status=True,
                 )
-                self._sessions[self.runtime_endpoint_url] = session
+                self._sessions[(current_thread, url)] = session
         return session
 
     def _get_headers(
