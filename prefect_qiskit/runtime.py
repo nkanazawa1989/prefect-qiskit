@@ -27,13 +27,11 @@ from prefect._internal.compatibility.async_dispatch import async_dispatch
 from prefect.blocks.core import Block
 from prefect.cache_policies import NO_CACHE, CacheKeyFnPolicy
 from prefect.tasks import Task
-from prefect.utilities.asyncutils import run_coro_as_sync
-from pydantic import Field, model_validator
+from pydantic import Field
 from qiskit.primitives import PrimitiveResult
 from qiskit.primitives.containers.estimator_pub import EstimatorPub, EstimatorPubLike
 from qiskit.primitives.containers.sampler_pub import SamplerPub, SamplerPubLike
 from qiskit.transpiler import Target
-from typing_extensions import Self
 
 from prefect_qiskit.models import AsyncRuntimeClientInterface
 from prefect_qiskit.primitives.runner import retry_on_failure, run_primitive
@@ -168,18 +166,6 @@ class QuantumRuntime(Block):
         ),
         title="Execution Cache",
     )
-
-    @model_validator(mode="after")
-    def check_resource(self) -> Self:
-        client: AsyncRuntimeClientInterface = self.credentials.get_client()
-
-        allowed_list = run_coro_as_sync(client.get_resources())
-        if self.resource_name not in allowed_list:
-            raise ValueError(
-                f"Resource name {self.resource_name} is not available under your account. "
-                f"Following resources are available: {', '.join(allowed_list)}."
-            )
-        return self
 
     async def async_get_target(
         self,
